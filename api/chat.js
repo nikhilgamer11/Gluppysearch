@@ -1,54 +1,78 @@
 export default async function handler(req, res) {
-  // Only allow POST
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  // CORS headers — lock this down to your domain in production if you like
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
   const { messages } = req.body;
-
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: 'messages array required' });
   }
 
   const GEMINI_KEY = process.env.GEMINI_API_KEY;
-  if (!GEMINI_KEY) {
-    return res.status(500).json({ error: 'Gemini API key not configured on server.' });
+  const SEARCH_KEY = process.env.GOOGLE_SEARCH_API_KEY;
+  const SEARCH_CX  = process.env.GOOGLE_SEARCH_CX;
+
+  if (!GEMINI_KEY) return res.status(500).json({ error: 'GEMINI_API_KEY not configured.' });
+  if (!SEARCH_KEY) return res.status(500).json({ error: 'GOOGLE_SEARCH_API_KEY not configured.' });
+  if (!SEARCH_CX)  return res.status(500).json({ error: 'GOOGLE_SEARCH_CX not configured.' });
+
+  // Step 1: Get the latest user question
+  const userQuestion = messages[messages.length - 1]?.content || '';
+
+  // Step 2: Search the real LearnUpon KB via Google Custom Search
+  let searchContext = '';
+  let searchResults = [];
+
+  try {
+    const searchUrl = `https://www.googleapis.com/customsearch/v1?key=${SEARCH_KEY}&cx=${SEARCH_CX}&q=${encodeURIComponent(userQuestion)}&num=5`;
+    const searchRes = await fetch(searchUrl);
+    const searchData = await searchRes.json();
+
+    if (searchData.items && searchData.items.length > 0) {
+      searchResults = searchData.items.map(item => ({
+        title: item.title,
+        link: item.link,
+        snippet: item.snippet
+      }));
+
+      searchContext = `
+Here are REAL articles found in the LearnUpon knowledge base for this question:
+
+${searchResults.map((r, i) => `[${i + 1}] Title: ${r.title}
+URL: ${r.link}
+Summary: ${r.snippet}`).join('\n\n')}
+
+IMPORTANT: Only use the exact URLs listed above. Never guess or generate URLs.
+`;
+    } else {
+      searchContext = `No specific articles were found. Answer based on your LearnUpon knowledge but do not include any article links.`;
+    }
+  } catch (err) {
+    searchContext = `Search unavailable. Answer based on your LearnUpon knowledge but do not include any article links.`;
   }
 
-  const SYSTEM_PROMPT = `You are Cluppy, a LearnUpon support bot. Your primary purpose is to assist users by providing information and solutions directly from the official LearnUpon knowledge base and API/Webhooks documentation. You must adhere strictly to the provided resources and avoid using any external information or prior knowledge.
+  // Step 3: Build the system prompt with real search results injected
+  const SYSTEM_PROMPT = `You are Cluppy, a LearnUpon support bot. You answer questions strictly based on the official LearnUpon knowledge base.
 
-Purpose and Goals:
-* Provide accurate and concise answers to user queries regarding LearnUpon's platform, features, API, and Webhooks.
-* Guide users to relevant articles, documentation, or sections within the specified LearnUpon resources.
-* Ensure all responses are solely based on information found within the provided LearnUpon domains.
+${searchContext}
 
-Behaviors and Rules:
+Rules:
+1. Answer ONLY using the information and URLs from the search results above.
+2. NEVER generate, guess, or make up article URLs. Only use the exact URLs provided above.
+3. If no search results were found, say: "I couldn't find a specific article for this. Please search at https://support.learnupon.com/hc/en-us"
+4. Always be accurate, concise, and professional.
+5. Always end your response with a "📋 Next Steps" section with 2-3 actionable suggestions.
 
-1) Information Sourcing:
-   a) Only use the knowledge base found at https://support.learnupon.com/hc/en-us.
-   b) Only use the API guide found at: https://docs.learnupon.com/docs/api/v1/#learnupon-api-guide.
-   c) Only use the Webhooks guide found at https://docs.learnupon.com/webhooks/v2/#webhooks-version-2-0-guide.
-   d) When answering, reference content from support.learnupon.com or docs.learnupon.com only.
+Response format:
+- Direct answer to the question
+- Step-by-step instructions if applicable
+- 🔗 Reference: [exact URL from search results only]
+- 📋 Next Steps: 2-3 actionable suggestions the user might want to do next`;
 
-2) Response Generation:
-   a) Do not answer questions based on prior knowledge or general understanding.
-   b) Only respond if a clear answer is found within the specified LearnUpon support site or documentation.
-   c) If you cannot find an answer, state: "I couldn't find an answer to that in the LearnUpon docs. Please visit https://support.learnupon.com for more help."
-   d) Prioritize direct, factual information over conversational filler.
-   e) When relevant, include a direct link to the appropriate LearnUpon documentation page.
-
-3) Interaction Guidelines:
-   a) Maintain a professional and helpful tone.
-   b) Be precise and avoid ambiguity.
-
-Overall Tone: Professional, knowledgeable, helpful. Direct and to the point.`;
-
-  // Convert our simple {role, content} history to Gemini's format
-  // Gemini uses "user" and "model" roles
+  // Step 4: Call Gemini with the enriched context
   const geminiContents = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }]
@@ -67,7 +91,7 @@ Overall Tone: Professional, knowledgeable, helpful. Direct and to the point.`;
           contents: geminiContents,
           generationConfig: {
             maxOutputTokens: 1024,
-            temperature: 0.2,
+            temperature: 0.1,
           }
         })
       }
@@ -81,9 +105,9 @@ Overall Tone: Professional, knowledgeable, helpful. Direct and to the point.`;
     }
 
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text
-      || "I couldn't find an answer in the LearnUpon docs.";
+      || "I couldn't find an answer in the LearnUpon docs. Please visit https://support.learnupon.com/hc/en-us";
 
-    return res.status(200).json({ reply });
+    return res.status(200).json({ reply, sources: searchResults });
 
   } catch (err) {
     return res.status(500).json({ error: `Server error: ${err.message}` });
